@@ -1,7 +1,8 @@
 import { Server } from "node:http";
 import { loadConfig, networkConfigs } from "./config.ts";
 import { openStorage } from "./lib/store/index.ts";
-import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
+import { SqliteStorage } from "./lib/store/sqlite.ts";
+import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent, vacuumDatabase } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -222,6 +223,33 @@ const adminHooks: AdminHooks = {
   getPastDueMandates: async () => {
     const db = defaultRuntime.db;
     return getPastDueMandatesFromDb(db);
+  },
+  vacuumDb: async () => {
+    const db = defaultRuntime.db;
+    // `VACUUM` requires a live DatabaseSync handle; it is only available on
+    // the SQLite backend. On PostgreSQL the hook is not wired, so the route
+    // answers 503 rather than attempting to run `VACUUM` through the Storage
+    // abstraction (which cannot run DDL statements outside a transaction).
+    const sqlite = db instanceof SqliteStorage ? db.database : undefined;
+    if (!sqlite) {
+      throw new Error("VACUUM is only supported on the SQLite backend");
+    }
+    try {
+      const result = vacuumDatabase(sqlite);
+      await logAuditEvent(db, {
+        action: "db_vacuum",
+        success: true,
+        details: result,
+      });
+      return result;
+    } catch (err) {
+      await logAuditEvent(db, {
+        action: "db_vacuum",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   },
 };
 if (keeper && runKeeperPass) {
