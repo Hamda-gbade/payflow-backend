@@ -259,12 +259,19 @@ in the builder, production dependencies only in the final image.
   (the ledger the contracts were deployed at); with neither, the oldest ledger
   the RPC node still serves. A cursor older than the node's retention window is
   moved forward with a warning, since RPC rejects ranges that start before it.
-- **Exact ranges.** Each pass reads `[cursor, cursor + 8000)` windows and
-  never a ledger the RPC node is still closing. Up to
-  `INDEXER_FETCH_CONCURRENCY` windows are fetched at once, but they are
-  applied in ledger order and the cursor advances only after a window is
+- **Exact ranges.** Each pass reads `[cursor, cursor + INDEXER_BATCH_SIZE)`
+  batches and never a ledger the RPC node is still closing. Up to
+  `INDEXER_FETCH_CONCURRENCY` batches are fetched at once, but they are
+  applied in ledger order and the cursor advances only after a batch is
   applied. Paging continues until a page is empty or passes the range end: a
   short page does not mean the range is exhausted.
+- **One transaction per batch.** A batch's raw events, its projection rows and
+  its cursor are written in one transaction, and within it each ledger is
+  written together: one multi-row `INSERT OR IGNORE` carries a ledger's raw
+  events instead of one round trip per event. Batching the whole pass into one
+  transaction was rejected on purpose: a fetch failure after some batches have
+  been applied must leave their cursor in place, so the next pass resumes at the
+  failed one instead of re-reading everything.
 - **Catch-up progress is logged at a steady cadence.** Each time the cursor
   moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000) the indexer logs
   one `indexer progress` line with `network`, `cursor`, `latest`, `behind`,
@@ -1086,7 +1093,8 @@ examined without API downtime.
 | `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
-| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
+| `INDEXER_BATCH_SIZE` | `8000` | Ledgers one batch reads and applies before the cursor moves (1–8000, the RPC's getEvents window) |
+| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger batches one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
@@ -1094,6 +1102,9 @@ examined without API downtime.
 | `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
+| `DATABASE_POOL_MAX` | `10` | PostgreSQL connections per process (1–100); every API, indexer and keeper process holds its own pool |
+| `DATABASE_ACQUIRE_TIMEOUT_MS` | `10000` | How long a query waits for a free connection before failing with a `DATABASE_ACQUIRE_TIMEOUT_MS` error |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `30000` | `statement_timeout` sent to PostgreSQL with every connection, so a runaway query is cancelled server-side |
 | `REDIS_URL` | — | Optional `redis://`/`rediss://` shared cache for merchant summaries and token metadata; defaults to in-memory cache |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
@@ -1159,7 +1170,10 @@ MAINNET_SUBSCRIPTION_ID=C...
 MAINNET_INDEXER_START_LEDGER=5110418
 ```
 
-Each network runs its own indexer with its own cursor and projection. With
+Each network runs its own indexer with its own cursor, projection and poll
+cadence: `<NAME>_INDEXER_INTERVAL_MS` and `<NAME>_INDEXER_BATCH_SIZE` override
+the defaults for that network only, so a busy mainnet indexer can keep the
+8,000-ledger batches while a quiet testnet polls less often. With
 `DATABASE_URL`, each network is isolated in its own PostgreSQL schema; otherwise
 it uses a SQLite file derived from `DATABASE_PATH` (`./payflow.db` becomes
 `./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise. Ledger

@@ -170,6 +170,14 @@ const schema = z.object({
     .transform((v) => v === "true"),
 
   INDEXER_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Ledgers one indexing batch reads and applies before the cursor moves
+   * (#241). This is the tuning knob for a catch-up: a larger batch means
+   * fewer, longer RPC windows and fewer cursor commits; a smaller one keeps
+   * each pass short, so a stop or a `SIGHUP` takes effect sooner. It must
+   * stay inside the RPC's getEvents window, so 8,000 is the ceiling.
+   */
+  INDEXER_BATCH_SIZE: z.coerce.number().int().positive().max(8_000).default(8_000),
   INDEXER_START_LEDGER: z.coerce.number().int().nonnegative().default(0),
   /**
    * A full-history archive that can re-serve ledgers the RPC node no longer
@@ -243,6 +251,24 @@ const schema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   DATABASE_URL: postgresUrl,
+  /**
+   * Most connections one process opens to PostgreSQL (#263). Every API
+   * process and every indexer/keeper process holds its own pool, so the cap
+   * must leave room for the others inside the server's max_connections.
+   */
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
+  /**
+   * How long a query waits for a free pooled connection before it fails
+   * (#263). Without a bound, a saturated pool makes every request wait
+   * forever and a slow query takes the whole process down with it.
+   */
+  DATABASE_ACQUIRE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Server-side cap on how long a single statement may run (#263). A query
+   * that exceeds it is cancelled by PostgreSQL and answers with an error
+   * instead of pinning a connection; the indexer retries on its next pass.
+   */
+  DATABASE_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
@@ -322,6 +348,16 @@ const schema = z.object({
 
 export type Config = z.infer<typeof schema>;
 
+/** How a process sizes and bounds its pool for one PostgreSQL network (#263). */
+export interface PoolSettings {
+  /** Most connections this process opens at once. */
+  max: number;
+  /** How long a query waits for a free connection before it fails, in ms. */
+  acquireTimeoutMs: number;
+  /** Server-side cap on one statement's runtime, in ms. */
+  statementTimeoutMs: number;
+}
+
 /** One network this instance indexes and serves. */
 export interface NetworkConfig {
   /** Route segment (`/api/<name>/...`) and log label. */
@@ -338,12 +374,18 @@ export interface NetworkConfig {
   databasePath: string;
   /** Shared PostgreSQL server, isolated by per-network schema when configured. */
   databaseUrl?: string | undefined;
+  /** Sizing and timeouts for this network's PostgreSQL pool (#263). */
+  pool?: PoolSettings | undefined;
   /** Full-history archive URL used to backfill a detected gap. */
   archiveUrl?: string | undefined;
   /** Advance the cursor past a gap the RPC cannot serve. */
   allowGaps?: boolean | undefined;
   /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
   progressLedgers?: number | undefined;
+  /** Ledgers one indexing batch reads and applies at a time (#241). */
+  batchSize?: number | undefined;
+  /** How often the indexer loop runs a pass, in milliseconds (#241). */
+  indexerIntervalMs?: number | undefined;
 }
 
 /**
@@ -440,6 +482,14 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
     archiveUrl: config.ARCHIVE_URL,
     allowGaps: config.ALLOW_GAPS,
     progressLedgers: config.INDEXER_PROGRESS_LEDGERS,
+    // A network may pace its own passes; otherwise it follows the defaults.
+    batchSize: network.batchSize ?? config.INDEXER_BATCH_SIZE,
+    indexerIntervalMs: network.indexerIntervalMs ?? config.INDEXER_INTERVAL_MS,
+    pool: {
+      max: config.DATABASE_POOL_MAX,
+      acquireTimeoutMs: config.DATABASE_ACQUIRE_TIMEOUT_MS,
+      statementTimeoutMs: config.DATABASE_STATEMENT_TIMEOUT_MS,
+    },
   }));
 }
 
@@ -452,6 +502,13 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     [`${prefix}_VAULT_ID`]: contractId,
     [`${prefix}_SUBSCRIPTION_ID`]: contractId,
     [`${prefix}_INDEXER_START_LEDGER`]: z.coerce.number().int().nonnegative().default(0),
+    [`${prefix}_INDEXER_BATCH_SIZE`]: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(8_000)
+      .optional(),
+    [`${prefix}_INDEXER_INTERVAL_MS`]: z.coerce.number().int().positive().optional(),
     [`${prefix}_DATABASE_PATH`]: z.string().min(1).optional(),
   });
   const parsed = schema.safeParse(env);
@@ -471,6 +528,12 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     vaultId: String(data[`${prefix}_VAULT_ID`]),
     subscriptionId: String(data[`${prefix}_SUBSCRIPTION_ID`]),
     startLedger: Number(data[`${prefix}_INDEXER_START_LEDGER`] ?? 0),
+    ...(data[`${prefix}_INDEXER_BATCH_SIZE`] === undefined
+      ? {}
+      : { batchSize: Number(data[`${prefix}_INDEXER_BATCH_SIZE`]) }),
+    ...(data[`${prefix}_INDEXER_INTERVAL_MS`] === undefined
+      ? {}
+      : { indexerIntervalMs: Number(data[`${prefix}_INDEXER_INTERVAL_MS`]) }),
     databasePath:
       databasePath === undefined ? databasePathFor(base.DATABASE_PATH, name) : String(databasePath),
     databaseUrl: base.DATABASE_URL,

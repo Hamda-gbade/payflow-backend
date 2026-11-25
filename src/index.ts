@@ -280,7 +280,9 @@ const loops: Loop[] = [];
 if (runIndexer) {
   for (const rt of runtimes) {
     loops.push(
-      every(config.INDEXER_INTERVAL_MS, async () => {
+      // The poll cadence is per network (#241): a network configured on its
+      // own may pace its passes differently from the default.
+      every(rt.network.indexerIntervalMs ?? config.INDEXER_INTERVAL_MS, async () => {
         try {
           await rt.runPass();
         } catch {
